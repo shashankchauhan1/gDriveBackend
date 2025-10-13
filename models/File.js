@@ -20,7 +20,11 @@ const fileSchema = new mongoose.Schema({
   permissions: [{
     user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     role: { type: String, enum: ['viewer', 'editor'], default: 'viewer' }
-  }]
+  }],
+
+  // Trash support
+  isTrashed: { type: Boolean, default: false },
+  trashedAt: { type: Date }
 
 }, { timestamps: true }); // Adds createdAt and updatedAt
 

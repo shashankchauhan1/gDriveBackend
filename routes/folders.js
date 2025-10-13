@@ -42,10 +42,19 @@ router.get('/:id/path', auth, async (req, res) => {
     while (currentFolderId) {
       const folder = await File.findById(currentFolderId);
 
-      // Security check: ensure the folder exists and belongs to the user
-      if (!folder || folder.owner.toString() !== req.user.id) {
-        return res.status(404).json({ msg: 'Path not found' });
+      // Security: ensure the folder exists and user has access via ownership or permissions on any ancestor
+      if (!folder) return res.status(404).json({ msg: 'Path not found' });
+      let hasAccess = false;
+      let node = folder;
+      while (node) {
+        if (
+          node.owner.toString() === req.user.id ||
+          node.permissions.some(p => p.user.toString() === req.user.id)
+        ) { hasAccess = true; break; }
+        if (!node.parentId) break;
+        node = await File.findById(node.parentId);
       }
+      if (!hasAccess) return res.status(404).json({ msg: 'Path not found' });
 
       // Add the folder to the beginning of the path array
       path.unshift({ _id: folder._id, filename: folder.filename });

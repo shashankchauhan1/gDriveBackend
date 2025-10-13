@@ -5,6 +5,7 @@ import { v2 as cloudinary } from 'cloudinary';
 import auth from '../middleware/auth.js';
 import File from '../models/File.js';
 import User from '../models/User.js'; // <-- Import the User model
+import History from '../models/History.js';
 import dotenv from 'dotenv'; 
 
 dotenv.config();
@@ -64,6 +65,22 @@ router.post('/upload', auth, (req, res, next) => {
       return res.status(400).json({ msg: 'No file uploaded or invalid file type.' });
     }
 
+    // Optional parent folder to place the file in
+    const { parentId } = req.body;
+    let parent = null;
+    if (parentId) {
+      parent = await File.findById(parentId);
+      if (!parent) return res.status(404).json({ msg: 'Parent folder not found' });
+      // Allow if user owns the parent or has been granted permission on any ancestor
+      let node = parent; let hasAccess = false;
+      while (node) {
+        if (node.owner.toString() === req.user.id || node.permissions.some(p => p.user.toString() === req.user.id)) { hasAccess = true; break; }
+        if (!node.parentId) break;
+        node = await File.findById(node.parentId);
+      }
+      if (!hasAccess) return res.status(401).json({ msg: 'Not authorized to upload to this folder' });
+    }
+
     // Upload file to Cloudinary
     const uploadStream = cloudinary.uploader.upload_stream(
       { resource_type: 'auto', folder: 'mern-drive' },
@@ -82,6 +99,7 @@ router.post('/upload', auth, (req, res, next) => {
           fileType: result.resource_type,
           size: result.bytes,
           type: 'file', // Required by schema
+          parentId: parent ? parent._id : null,
         });
 
         await newFile.save();
@@ -102,11 +120,65 @@ router.post('/upload', auth, (req, res, next) => {
 // @desc    Get all files AND folders for a user in a specific parent folder
 router.get('/', auth, async (req, res) => {
   try {
-    // Find items where the parentId matches the query, or is null for the root
+    // Parent folder to list
     const parentId = req.query.parentId || null;
 
-    const items = await File.find({ owner: req.user.id, parentId: parentId });
-    res.json(items);
+    // Root listing: show user's own items in root + any items (files or folders) explicitly shared at root
+    if (!parentId) {
+      const items = await File.find({
+        $and: [ { parentId: null }, { isTrashed: { $ne: true } }, { $or: [
+          { owner: req.user.id },
+          { 'permissions.user': req.user.id }
+        ] } ]
+      });
+      return res.json(items);
+    }
+
+    // Non-root: verify access via ancestor chain (owner or permissions on any ancestor)
+    let current = await File.findById(parentId);
+    if (!current) return res.status(404).json({ msg: 'Parent folder not found' });
+    let hasAccess = false;
+    while (current) {
+      if (
+        current.owner.toString() === req.user.id ||
+        current.permissions.some(p => p.user.toString() === req.user.id)
+      ) {
+        hasAccess = true; break;
+      }
+      if (!current.parentId) break;
+      current = await File.findById(current.parentId);
+    }
+    if (!hasAccess) return res.status(401).json({ msg: 'Not authorized to view this folder' });
+
+    // If user has access to parent folder, list all its children (regardless of who owns them)
+    const items = await File.find({ parentId: parentId, isTrashed: { $ne: true } });
+    return res.json(items);
+  } catch (err) {
+    console.error(err.message);
+    return res.status(500).send('Server Error');
+  }
+});
+
+// @route   POST /api/files/:id/open
+// @desc    Record an "open" event for history
+router.post('/:id/open', auth, async (req, res) => {
+  try {
+    const file = await File.findById(req.params.id);
+    if (!file) return res.status(404).json({ msg: 'File not found' });
+
+    // Access check: owner or permission on any ancestor
+    let node = file.type === 'folder' ? file : (file.parentId ? await File.findById(file.parentId) : file);
+    let hasAccess = false;
+    while (node) {
+      if (node.owner.toString() === req.user.id || node.permissions.some(p => p.user.toString() === req.user.id)) { hasAccess = true; break; }
+      if (!node.parentId) break;
+      node = await File.findById(node.parentId);
+    }
+    if (!hasAccess) return res.status(401).json({ msg: 'Not authorized' });
+
+    const entry = new History({ user: req.user.id, file: file._id, action: 'open' });
+    await entry.save();
+    res.status(201).json({ ok: true });
   } catch (err) {
     console.error(err.message);
     res.status(500).send('Server Error');
@@ -117,30 +189,149 @@ router.get('/', auth, async (req, res) => {
 // @desc    Delete a file
 router.delete('/:id', auth, async (req, res) => {
   try {
-    // 1. Find the file in the database
+    // Soft delete: move to trash (owner only)
     const file = await File.findById(req.params.id);
-    if (!file) {
-      return res.status(404).json({ msg: 'File not found' });
-    }
+    if (!file) return res.status(404).json({ msg: 'File not found' });
+    if (file.owner.toString() !== req.user.id) return res.status(401).json({ msg: 'User not authorized' });
 
-    // 2. **Crucial Security Check:** Ensure the user owns the file
-    if (file.owner.toString() !== req.user.id) {
-      return res.status(401).json({ msg: 'User not authorized' });
-    }
-
-    // 3. Delete the file from Cloudinary
-    await cloudinary.uploader.destroy(file.cloudinaryPublicId);
-
-    // 4. Delete the file record from MongoDB
-    await File.findByIdAndDelete(req.params.id);
-
-    res.json({ msg: 'File deleted successfully' });
+    file.isTrashed = true;
+    file.trashedAt = new Date();
+    await file.save();
+    res.json({ msg: 'Moved to trash' });
   } catch (err) {
     console.error(err.message);
     res.status(500).send('Server Error');
   }
 });
 
+// @route   PUT /api/files/:id/restore
+// @desc    Restore a trashed item (owner only)
+router.put('/:id/restore', auth, async (req, res) => {
+  try {
+    const file = await File.findById(req.params.id);
+    if (!file) return res.status(404).json({ msg: 'File not found' });
+    if (file.owner.toString() !== req.user.id) return res.status(401).json({ msg: 'User not authorized' });
+    file.isTrashed = false;
+    file.trashedAt = undefined;
+    await file.save();
+    res.json(file);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Server Error');
+  }
+});
+
+// @route   GET /api/files/trash
+// @desc    List trashed items for current user
+router.get('/trash', auth, async (req, res) => {
+  try {
+    const items = await File.find({ owner: req.user.id, isTrashed: true }).sort({ trashedAt: -1 });
+    res.json(items);
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Server Error');
+  }
+});
+
+// @route   DELETE /api/files/trash/:id
+// @desc    Permanently delete an item in trash (owner only)
+router.delete('/trash/:id', auth, async (req, res) => {
+  try {
+    const file = await File.findById(req.params.id);
+    if (!file) return res.status(404).json({ msg: 'File not found' });
+    if (file.owner.toString() !== req.user.id) return res.status(401).json({ msg: 'User not authorized' });
+    if (!file.isTrashed) return res.status(400).json({ msg: 'File is not in trash' });
+
+    if (file.type === 'file' && file.cloudinaryPublicId) {
+      try { await cloudinary.uploader.destroy(file.cloudinaryPublicId); } catch {}
+    }
+    await File.findByIdAndDelete(req.params.id);
+    res.json({ msg: 'Deleted permanently' });
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Server Error');
+  }
+});
+
+
+// @route   PUT /api/files/:id/rename
+// @desc    Rename a file or folder (owner or users with editor role on any ancestor)
+router.put('/:id/rename', auth, async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name || !name.trim()) return res.status(400).json({ msg: 'New name is required' });
+
+    const item = await File.findById(req.params.id);
+    if (!item) return res.status(404).json({ msg: 'Item not found' });
+
+    // Access: owner OR editor in this item or any ancestor
+    let node = item;
+    let canEdit = false;
+    while (node) {
+      if (node.owner.toString() === req.user.id) { canEdit = true; break; }
+      const editor = node.permissions.find(p => p.user.toString() === req.user.id && p.role === 'editor');
+      if (editor) { canEdit = true; break; }
+      if (!node.parentId) break;
+      node = await File.findById(node.parentId);
+    }
+    if (!canEdit) return res.status(401).json({ msg: 'Not authorized to rename' });
+
+    item.filename = name.trim();
+    await item.save();
+    return res.json(item);
+  } catch (err) {
+    console.error(err.message);
+    return res.status(500).send('Server Error');
+  }
+});
+
+// @route   POST /api/files/:id/revoke
+// @desc    Revoke a user's access by email (owner only)
+router.post('/:id/revoke', auth, async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ msg: 'Email is required' });
+
+    const item = await File.findById(req.params.id);
+    if (!item) return res.status(404).json({ msg: 'Item not found' });
+    if (item.owner.toString() !== req.user.id) return res.status(401).json({ msg: 'Only owner can revoke' });
+
+    const userToRevoke = await User.findOne({ email });
+    if (!userToRevoke) return res.status(404).json({ msg: 'User not found' });
+
+    item.permissions = item.permissions.filter(p => p.user.toString() !== userToRevoke.id);
+    await item.save();
+    return res.json(item.permissions);
+  } catch (err) {
+    console.error(err.message);
+    return res.status(500).send('Server Error');
+  }
+});
+
+// @route   GET /api/files/search
+// @desc    Search files/folders by name accessible to the user
+router.get('/search', auth, async (req, res) => {
+  try {
+    const { q } = req.query;
+    if (!q || !q.trim()) return res.json([]);
+    const regex = new RegExp(q.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+
+    // Find accessible items: owned or shared directly
+    const ownedOrShared = await File.find({
+      $or: [
+        { owner: req.user.id },
+        { 'permissions.user': req.user.id }
+      ],
+      isTrashed: { $ne: true },
+      filename: regex,
+    }).limit(100);
+
+    return res.json(ownedOrShared);
+  } catch (err) {
+    console.error(err.message);
+    return res.status(500).send('Server Error');
+  }
+});
 
 // @route   POST /api/files/:id/share
 // @desc    Share a file with another user
