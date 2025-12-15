@@ -6,6 +6,7 @@ import auth from '../middleware/auth.js';
 import File from '../models/File.js';
 import User from '../models/User.js'; // <-- Import the User model
 import History from '../models/History.js';
+import FileVersion from '../models/FileVersion.js';
 import dotenv from 'dotenv'; 
 
 dotenv.config();
@@ -30,17 +31,84 @@ const upload = multer({
   storage,
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
   fileFilter: (req, file, cb) => {
-    // Accept only images and PDFs
-    if (
-      file.mimetype.startsWith('image/') ||
-      file.mimetype === 'application/pdf'
-    ) {
+    // Accept images and PDFs (by MIME *or* extension to handle odd user agents)
+    const mime = file.mimetype || '';
+    const name = (file.originalname || '').toLowerCase();
+    const isImage = mime.startsWith('image/');
+    const isPdfMime = mime === 'application/pdf' || mime === 'application/x-pdf';
+    const isPdfExt = name.endsWith('.pdf');
+
+    if (isImage || isPdfMime || isPdfExt) {
       cb(null, true);
     } else {
       cb(new Error('Only images and PDFs are allowed'));
     }
   }
 });
+
+const loadFromCache = async (id, cache) => {
+  if (!id) return null;
+  const key = id.toString();
+  if (cache.has(key)) return cache.get(key);
+  const doc = await File.findById(id);
+  if (doc) cache.set(key, doc);
+  return doc;
+};
+
+const resolveUserRole = async (item, userId, cache = new Map()) => {
+  if (!item) return null;
+  let node = item;
+  while (node) {
+    const ownerId = node.owner?._id ? node.owner._id.toString() : node.owner?.toString?.();
+    if (ownerId === userId) return 'owner';
+    const permission = node.permissions?.find?.((p) => {
+      const permUserId = p.user?._id ? p.user._id.toString() : p.user?.toString?.();
+      return permUserId === userId;
+    });
+    if (permission) return permission.role;
+    if (!node.parentId) break;
+    node = await loadFromCache(node.parentId, cache);
+  }
+  return null;
+};
+
+const attachEffectiveRole = async (items, userId) => {
+  const cache = new Map();
+  return Promise.all(items.map(async (doc) => {
+    const role = await resolveUserRole(doc, userId, cache);
+    const plain = doc.toObject();
+    const ownerId = doc.owner?._id ? doc.owner._id.toString() : doc.owner?.toString?.();
+    plain.effectiveRole = role || (ownerId === userId ? 'owner' : null);
+    return plain;
+  }));
+};
+
+const ensureFileVersionSeed = async (fileDoc, fallbackUploader) => {
+  if (!fileDoc || fileDoc.type !== 'file') return;
+  const count = await FileVersion.countDocuments({ file: fileDoc._id });
+  if (count > 0) {
+    if (fileDoc.versionCount !== count) {
+      fileDoc.versionCount = count;
+      await fileDoc.save();
+    }
+    return;
+  }
+  if (!fileDoc.cloudinaryUrl || !fileDoc.cloudinaryPublicId) return;
+  const ownerId = fallbackUploader?._id ? fallbackUploader._id : fallbackUploader;
+  const fallbackOwner = fileDoc.owner?._id ? fileDoc.owner._id : fileDoc.owner;
+  const version = await FileVersion.create({
+    file: fileDoc._id,
+    versionNumber: 1,
+    cloudinaryUrl: fileDoc.cloudinaryUrl,
+    cloudinaryPublicId: fileDoc.cloudinaryPublicId,
+    fileType: fileDoc.fileType,
+    size: fileDoc.size,
+    uploadedBy: ownerId || fallbackOwner,
+  });
+  fileDoc.currentVersion = version._id;
+  fileDoc.versionCount = 1;
+  await fileDoc.save();
+};
 
 // @route   POST /api/files/upload
 // @desc    Upload a file
@@ -103,7 +171,10 @@ router.post('/upload', auth, (req, res, next) => {
         });
 
         await newFile.save();
-        res.status(201).json(newFile);
+        await ensureFileVersionSeed(newFile, req.user.id);
+        const payload = newFile.toObject();
+        payload.effectiveRole = 'owner';
+        res.status(201).json(payload);
       }
     );
 
@@ -131,7 +202,8 @@ router.get('/', auth, async (req, res) => {
           { 'permissions.user': req.user.id }
         ] } ]
       });
-      return res.json(items);
+      const enriched = await attachEffectiveRole(items, req.user.id);
+      return res.json(enriched);
     }
 
     // Non-root: verify access via ancestor chain (owner or permissions on any ancestor)
@@ -152,7 +224,8 @@ router.get('/', auth, async (req, res) => {
 
     // If user has access to parent folder, list all its children (regardless of who owns them)
     const items = await File.find({ parentId: parentId, isTrashed: { $ne: true } });
-    return res.json(items);
+    const enriched = await attachEffectiveRole(items, req.user.id);
+    return res.json(enriched);
   } catch (err) {
     console.error(err.message);
     return res.status(500).send('Server Error');
@@ -166,15 +239,10 @@ router.post('/:id/open', auth, async (req, res) => {
     const file = await File.findById(req.params.id);
     if (!file) return res.status(404).json({ msg: 'File not found' });
 
-    // Access check: owner or permission on any ancestor
-    let node = file.type === 'folder' ? file : (file.parentId ? await File.findById(file.parentId) : file);
-    let hasAccess = false;
-    while (node) {
-      if (node.owner.toString() === req.user.id || node.permissions.some(p => p.user.toString() === req.user.id)) { hasAccess = true; break; }
-      if (!node.parentId) break;
-      node = await File.findById(node.parentId);
+    const role = await resolveUserRole(file, req.user.id);
+    if (!role && file.owner.toString() !== req.user.id) {
+      return res.status(401).json({ msg: 'Not authorized' });
     }
-    if (!hasAccess) return res.status(401).json({ msg: 'Not authorized' });
 
     const entry = new History({ user: req.user.id, file: file._id, action: 'open' });
     await entry.save();
@@ -192,7 +260,8 @@ router.delete('/:id', auth, async (req, res) => {
     // Soft delete: move to trash (owner only)
     const file = await File.findById(req.params.id);
     if (!file) return res.status(404).json({ msg: 'File not found' });
-    if (file.owner.toString() !== req.user.id) return res.status(401).json({ msg: 'User not authorized' });
+    const role = await resolveUserRole(file, req.user.id);
+    if (!role || role === 'viewer') return res.status(401).json({ msg: 'User not authorized' });
 
     file.isTrashed = true;
     file.trashedAt = new Date();
@@ -211,8 +280,19 @@ router.put('/:id/restore', auth, async (req, res) => {
     const file = await File.findById(req.params.id);
     if (!file) return res.status(404).json({ msg: 'File not found' });
     if (file.owner.toString() !== req.user.id) return res.status(401).json({ msg: 'User not authorized' });
+    let parentValid = true;
+    if (file.parentId) {
+      const parent = await File.findById(file.parentId);
+      if (!parent || parent.isTrashed) {
+        parentValid = false;
+      }
+    }
+
     file.isTrashed = false;
     file.trashedAt = undefined;
+    if (!parentValid) {
+      file.parentId = null;
+    }
     await file.save();
     res.json(file);
   } catch (err) {
@@ -242,8 +322,14 @@ router.delete('/trash/:id', auth, async (req, res) => {
     if (file.owner.toString() !== req.user.id) return res.status(401).json({ msg: 'User not authorized' });
     if (!file.isTrashed) return res.status(400).json({ msg: 'File is not in trash' });
 
-    if (file.type === 'file' && file.cloudinaryPublicId) {
-      try { await cloudinary.uploader.destroy(file.cloudinaryPublicId); } catch {}
+    if (file.type === 'file') {
+      const versions = await FileVersion.find({ file: file._id });
+      await Promise.all(versions.map(async (v) => {
+        if (v.cloudinaryPublicId) {
+          try { await cloudinary.uploader.destroy(v.cloudinaryPublicId); } catch {}
+        }
+      }));
+      await FileVersion.deleteMany({ file: file._id });
     }
     await File.findByIdAndDelete(req.params.id);
     res.json({ msg: 'Deleted permanently' });
@@ -264,17 +350,10 @@ router.put('/:id/rename', auth, async (req, res) => {
     const item = await File.findById(req.params.id);
     if (!item) return res.status(404).json({ msg: 'Item not found' });
 
-    // Access: owner OR editor in this item or any ancestor
-    let node = item;
-    let canEdit = false;
-    while (node) {
-      if (node.owner.toString() === req.user.id) { canEdit = true; break; }
-      const editor = node.permissions.find(p => p.user.toString() === req.user.id && p.role === 'editor');
-      if (editor) { canEdit = true; break; }
-      if (!node.parentId) break;
-      node = await File.findById(node.parentId);
+    const role = await resolveUserRole(item, req.user.id);
+    if (!role || (role !== 'owner' && role !== 'editor')) {
+      return res.status(401).json({ msg: 'Not authorized to rename' });
     }
-    if (!canEdit) return res.status(401).json({ msg: 'Not authorized to rename' });
 
     item.filename = name.trim();
     await item.save();
@@ -326,7 +405,8 @@ router.get('/search', auth, async (req, res) => {
       filename: regex,
     }).limit(100);
 
-    return res.json(ownedOrShared);
+    const enriched = await attachEffectiveRole(ownedOrShared, req.user.id);
+    return res.json(enriched);
   } catch (err) {
     console.error(err.message);
     return res.status(500).send('Server Error');
@@ -338,6 +418,9 @@ router.get('/search', auth, async (req, res) => {
 router.post('/:id/share', auth, async (req, res) => {
   try {
     const { email, role } = req.body;
+    if (!['viewer', 'editor'].includes(role)) {
+      return res.status(400).json({ msg: 'Invalid role' });
+    }
 
     // 1. Find the file to be shared
     const file = await File.findById(req.params.id);
@@ -362,19 +445,205 @@ router.post('/:id/share', auth, async (req, res) => {
     }
 
     // 5. Check if already shared with this user
-    const isAlreadyShared = file.permissions.some(p => p.user.toString() === userToShareWith.id);
-    if (isAlreadyShared) {
-      return res.status(400).json({ msg: 'File is already shared with this user' });
+    const existing = file.permissions.find(p => p.user.toString() === userToShareWith.id);
+    let mode = 'created';
+    if (existing) {
+      existing.role = role;
+      mode = 'updated';
+    } else {
+      file.permissions.push({ user: userToShareWith.id, role });
     }
-
-    // 6. Add the permission and save
-    file.permissions.push({ user: userToShareWith.id, role });
     await file.save();
 
-    res.json(file.permissions);
+    await file.populate('permissions.user', 'username email');
+
+    res.json({ permissions: file.permissions, mode });
   } catch (err) {
     console.error(err.message);
     res.status(500).send('Server Error');
+  }
+});
+
+// @route   GET /api/files/:id/permissions
+// @desc    Owner can view all user permissions for a file/folder
+router.get('/:id/permissions', auth, async (req, res) => {
+  try {
+    const item = await File.findById(req.params.id)
+      .populate('owner', 'username email')
+      .populate('permissions.user', 'username email');
+    if (!item) return res.status(404).json({ msg: 'Item not found' });
+    const ownerId = item.owner?._id ? item.owner._id.toString() : item.owner?.toString?.();
+    if (ownerId !== req.user.id) {
+      return res.status(401).json({ msg: 'Only owner can view permissions' });
+    }
+    return res.json({
+      owner: item.owner,
+      permissions: item.permissions,
+    });
+  } catch (err) {
+    console.error(err.message);
+    return res.status(500).send('Server Error');
+  }
+});
+
+// @route   PATCH /api/files/:id/permissions
+// @desc    Owner updates an existing user's role
+router.patch('/:id/permissions', auth, async (req, res) => {
+  try {
+    const { userId, role } = req.body;
+    if (!userId || !['viewer', 'editor'].includes(role)) {
+      return res.status(400).json({ msg: 'User and valid role are required' });
+    }
+    const item = await File.findById(req.params.id).populate('permissions.user', 'username email');
+    if (!item) return res.status(404).json({ msg: 'Item not found' });
+    const ownerId = item.owner?._id ? item.owner._id.toString() : item.owner?.toString?.();
+    if (ownerId !== req.user.id) {
+      return res.status(401).json({ msg: 'Only owner can modify permissions' });
+    }
+
+    const perm = item.permissions.find((p) => {
+      const permUserId = p.user?._id ? p.user._id.toString() : p.user?.toString?.();
+      return permUserId === userId;
+    });
+    if (!perm) return res.status(404).json({ msg: 'Permission not found' });
+    perm.role = role;
+    await item.save();
+    await item.populate('permissions.user', 'username email');
+    return res.json(item.permissions);
+  } catch (err) {
+    console.error(err.message);
+    return res.status(500).send('Server Error');
+  }
+});
+
+// @route   DELETE /api/files/:id/permissions/:userId
+// @desc    Owner revokes a user's access
+router.delete('/:id/permissions/:userId', auth, async (req, res) => {
+  try {
+    const item = await File.findById(req.params.id).populate('permissions.user', 'username email');
+    if (!item) return res.status(404).json({ msg: 'Item not found' });
+    const ownerId = item.owner?._id ? item.owner._id.toString() : item.owner?.toString?.();
+    if (ownerId !== req.user.id) {
+      return res.status(401).json({ msg: 'Only owner can revoke access' });
+    }
+    const before = item.permissions.length;
+    item.permissions = item.permissions.filter((p) => {
+      const permUserId = p.user?._id ? p.user._id.toString() : p.user?.toString?.();
+      return permUserId !== req.params.userId;
+    });
+    if (before === item.permissions.length) {
+      return res.status(404).json({ msg: 'Permission not found' });
+    }
+    await item.save();
+    await item.populate('permissions.user', 'username email');
+    return res.json(item.permissions);
+  } catch (err) {
+    console.error(err.message);
+    return res.status(500).send('Server Error');
+  }
+});
+
+// @route   GET /api/files/:id/versions
+// @desc    List versions for a file
+router.get('/:id/versions', auth, async (req, res) => {
+  try {
+    const file = await File.findById(req.params.id);
+    if (!file) return res.status(404).json({ msg: 'File not found' });
+    if (file.type !== 'file') return res.status(400).json({ msg: 'Versions only available for files' });
+    const role = await resolveUserRole(file, req.user.id);
+    if (!role && file.owner.toString() !== req.user.id) {
+      return res.status(401).json({ msg: 'Not authorized' });
+    }
+    await ensureFileVersionSeed(file, file.owner);
+    const versions = await FileVersion.find({ file: file._id })
+      .sort({ versionNumber: -1 })
+      .select('versionNumber createdAt cloudinaryUrl size fileType uploadedBy')
+      .populate('uploadedBy', 'username email');
+    return res.json({
+      versions,
+      versionCount: versions.length,
+    });
+  } catch (err) {
+    console.error(err.message);
+    return res.status(500).send('Server Error');
+  }
+});
+
+// @route   DELETE /api/files/:id/versions/:versionId
+// @desc    Delete a specific version (owner only)
+router.delete('/:id/versions/:versionId', auth, async (req, res) => {
+  try {
+    const file = await File.findById(req.params.id);
+    if (!file) return res.status(404).json({ msg: 'File not found' });
+    if (file.type !== 'file') return res.status(400).json({ msg: 'Versions only available for files' });
+    if (file.owner.toString() !== req.user.id) {
+      return res.status(401).json({ msg: 'Only owner can delete versions' });
+    }
+    await ensureFileVersionSeed(file, file.owner);
+    const version = await FileVersion.findOne({ _id: req.params.versionId, file: file._id });
+    if (!version) return res.status(404).json({ msg: 'Version not found' });
+    const total = await FileVersion.countDocuments({ file: file._id });
+    if (total <= 1) return res.status(400).json({ msg: 'Cannot delete the only version' });
+    try {
+      await cloudinary.uploader.destroy(version.cloudinaryPublicId);
+    } catch (destroyErr) {
+      console.warn('Failed to delete Cloudinary asset for version', destroyErr.message);
+    }
+    await version.deleteOne();
+    if (file.currentVersion?.toString() === version._id.toString()) {
+      const latest = await FileVersion.findOne({ file: file._id }).sort({ versionNumber: -1 });
+      if (latest) {
+        file.cloudinaryUrl = latest.cloudinaryUrl;
+        file.cloudinaryPublicId = latest.cloudinaryPublicId;
+        file.fileType = latest.fileType;
+        file.size = latest.size;
+        file.currentVersion = latest._id;
+      }
+    }
+    file.versionCount = Math.max(1, total - 1);
+    await file.save();
+    return res.json({ msg: 'Version deleted', versionCount: file.versionCount });
+  } catch (err) {
+    console.error(err.message);
+    return res.status(500).send('Server Error');
+  }
+});
+
+// @route   DELETE /api/files/:id/versions
+// @desc    Clear historic versions while keeping latest (owner only)
+router.delete('/:id/versions', auth, async (req, res) => {
+  try {
+    const file = await File.findById(req.params.id);
+    if (!file) return res.status(404).json({ msg: 'File not found' });
+    if (file.type !== 'file') return res.status(400).json({ msg: 'Versions only available for files' });
+    if (file.owner.toString() !== req.user.id) {
+      return res.status(401).json({ msg: 'Only owner can clear history' });
+    }
+    await ensureFileVersionSeed(file, file.owner);
+    const versions = await FileVersion.find({ file: file._id }).sort({ versionNumber: -1 });
+    if (versions.length <= 1) {
+      return res.status(400).json({ msg: 'No additional versions to remove' });
+    }
+    const [latest, ...older] = versions;
+    await Promise.all(older.map(async (v) => {
+      try {
+        await cloudinary.uploader.destroy(v.cloudinaryPublicId);
+      } catch (destroyErr) {
+        console.warn('Failed to delete Cloudinary asset for version', destroyErr.message);
+      }
+      await v.deleteOne();
+    }));
+    file.versionCount = 1;
+    file.currentVersion = latest._id;
+    file.cloudinaryUrl = latest.cloudinaryUrl;
+    file.cloudinaryPublicId = latest.cloudinaryPublicId;
+    file.fileType = latest.fileType;
+    file.size = latest.size;
+    await file.save();
+    return res.json({ msg: 'Version history cleared', versionCount: 1 });
+  } catch (err) {
+    console.error(err.message);
+    return res.status(500).send('Server Error');
   }
 });
 
@@ -387,7 +656,8 @@ router.get('/shared-with-me', auth, async (req, res) => {
       'permissions.user': req.user.id
     }).populate('owner', 'username email'); // Use populate to get owner's details
 
-    res.json(sharedFiles);
+    const enriched = await attachEffectiveRole(sharedFiles, req.user.id);
+    res.json(enriched);
   } catch (err) {
     console.error(err.message);
     res.status(500).send('Server Error');

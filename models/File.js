@@ -15,6 +15,8 @@ const fileSchema = new mongoose.Schema({
   cloudinaryPublicId: { type: String }, // Cloudinary public ID
   fileType: { type: String }, // MIME type
   size: { type: Number }, // File size in bytes
+  currentVersion: { type: mongoose.Schema.Types.ObjectId, ref: 'FileVersion' },
+  versionCount: { type: Number, default: 0 },
 
   // Permissions for sharing
   permissions: [{
