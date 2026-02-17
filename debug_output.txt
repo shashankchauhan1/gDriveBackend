@@ -1,0 +1,9 @@
+Starting Debug Session
+Testing Backend Connectivity...
+✅ Health Check Passed: {"message":"Cloud-Box backend is running!","timestamp":"2026-02-16T06:37:25.927Z","environment":"development"}
+
+Testing Login...
+Registering test user: debug_user_1771223845936
+✅ Registration Successful
+Logging in with test user...
+✅ Login Successful! Token received.
